@@ -6,6 +6,8 @@ import sys
 import time
 import threading
 
+from itertools import chain, izip
+
 # rediscluster imports
 from .client import StrictRedisCluster
 from .connection import by_node_context
@@ -15,7 +17,7 @@ from .exceptions import (
 from .utils import clusterdown_wrapper
 
 # 3rd party imports
-from redis import StrictRedis
+from redis import StrictRedis, WatchError
 from redis.exceptions import ResponseError, ConnectionError
 from redis._compat import imap, unicode, xrange
 
@@ -37,6 +39,8 @@ class StrictClusterPipeline(StrictRedisCluster):
         self.result_callbacks = result_callbacks
         self.startup_nodes = startup_nodes if startup_nodes else []
         self.use_threads = use_threads
+        self.explicit_transaction = False
+        self.watching = False
 
     def __repr__(self):
         return "{}".format(type(self).__name__)
@@ -54,6 +58,8 @@ class StrictClusterPipeline(StrictRedisCluster):
         return len(self.command_stack)
 
     def execute_command(self, *args, **kwargs):
+        if not self.explicit_transaction:
+            return self.immediate_execute_command(*args, **kwargs)
         return self.pipeline_execute_command(*args, **kwargs)
 
     def pipeline_execute_command(self, *args, **options):
@@ -164,9 +170,14 @@ class StrictClusterPipeline(StrictRedisCluster):
 
             # as we move through each command that still needs to be processed,
             # we figure out the slot number that command maps to, then from the slot determine the node.
+            slots = set()
             for i in attempt:
                 c = stack[i]
                 slot = self._determine_slot(*c[0])
+                slots.add(slot)
+                if self.explicit_transaction and len(slots) > 1:
+                    raise WatchError("Cannot run explicit transaction against more than 1 hashslot, keys: {}."
+                                     .format([str(c[0][1]) for c in stack]))
 
                 # normally we just refer to our internal node -> slot table that tells us where a given
                 # command should route to.
@@ -411,7 +422,12 @@ class StrictClusterPipeline(StrictRedisCluster):
         Code borrowed from StrictRedis so it can be fixed
         """
         # build up all commands into a single request to increase network perf
-        all_cmds = connection.pack_commands([args for args, _ in commands])
+        if self.explicit_transaction:
+            # build up all commands into a single request to increase network perf
+            cmds = chain([(('MULTI', ), {})], commands, [(('EXEC', ), {})])
+            all_cmds = connection.pack_commands([args for args, _ in cmds])
+        else:
+            all_cmds = connection.pack_commands([args for args, _ in commands])
 
         try:
             connection.send_packed_command(all_cmds)
@@ -420,11 +436,25 @@ class StrictClusterPipeline(StrictRedisCluster):
 
         response = []
 
-        for args, options in commands:
-            try:
-                response.append(self.parse_response(connection, args[0], **options))
-            except (ConnectionError, ResponseError):
-                response.append(sys.exc_info()[1])
+        if self.explicit_transaction:
+            # Get rid of multi values (OK, QUEUED...)
+            self.parse_response(connection, "_")
+            for _, _ in enumerate(commands):
+                self.parse_response(connection, "_")
+
+            response = self.parse_response(connection, "_")
+            if response is None:
+                raise WatchError("Watched variable changed.")
+            for r, cmd in izip(response, commands):
+                response.append(r)
+            self.explicit_transaction = False
+            self.watching = False
+        else:
+            for args, options in commands:
+                try:
+                    response.append(self.parse_response(connection, args[0], **options))
+                except (ConnectionError, ResponseError):
+                    response.append(sys.exc_info()[1])
 
         if raise_on_error:
             self.raise_first_error(commands, response)
@@ -432,10 +462,12 @@ class StrictClusterPipeline(StrictRedisCluster):
         return response
 
     def multi(self):
-        raise RedisClusterException("method multi() is not implemented")
+        self.explicit_transaction = True
+        # raise RedisClusterException("method multi() is not implemented")
 
     def immediate_execute_command(self, *args, **options):
-        raise RedisClusterException("method immediate_execute_command() is not implemented")
+        return super(StrictClusterPipeline, self).execute_command(*args, **options)
+        # raise RedisClusterException("method immediate_execute_command() is not implemented")
 
     def _execute_transaction(self, connection, commands, raise_on_error):
         raise RedisClusterException("method _execute_transaction() is not implemented")
@@ -444,10 +476,14 @@ class StrictClusterPipeline(StrictRedisCluster):
         raise RedisClusterException("method load_scripts() is not implemented")
 
     def watch(self, *names):
-        raise RedisClusterException("method watch() is not implemented")
+        self.watching = True
+        return self.immediate_execute_command('WATCH', *names)
+        # raise RedisClusterException("method watch() is not implemented")
 
     def unwatch(self):
-        raise RedisClusterException("method unwatch() is not implemented")
+        self.watching = False
+        return self.immediate_execute_command('UNWATCH')
+        # raise RedisClusterException("method unwatch() is not implemented")
 
     def script_load_for_pipeline(self, script):
         raise RedisClusterException("method script_load_for_pipeline() is not implemented")
